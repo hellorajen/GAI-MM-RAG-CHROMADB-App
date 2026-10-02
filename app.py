@@ -89,25 +89,49 @@ def _secret(name: str) -> str:
 
 import os
 import streamlit as st
+import os
+import google.generativeai as genai
+import streamlit as st
+
 
 def get_api_key() -> str:
-    # 1. User typed a custom key in the UI sidebar text input
+    """Retrieves Google Gemini API key and automatically configures genai SDK."""
+    key = ""
+
+    # 1. Custom key entered in sidebar text input
     user_typed_key = st.session_state.get("user_custom_api_key", "").strip()
     if user_typed_key:
-        return user_typed_key
-    
-    # 2. Check Streamlit Cloud Secrets (hidden backend key)
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return str(st.secrets["GEMINI_API_KEY"])
-        if "GOOGLE_API_KEY" in st.secrets:
-            return str(st.secrets["GOOGLE_API_KEY"])
-    except Exception:
-        pass
-    
-    # 3. Check Environment Variables
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+        key = user_typed_key
 
+    # 2. Streamlit Cloud Secrets (hidden backend key)
+    if not key:
+        try:
+            if (
+                "GEMINI_API_KEY" in st.secrets
+                and str(st.secrets["GEMINI_API_KEY"]).strip()
+            ):
+                key = str(st.secrets["GEMINI_API_KEY"]).strip()
+            elif (
+                "GOOGLE_API_KEY" in st.secrets
+                and str(st.secrets["GOOGLE_API_KEY"]).strip()
+            ):
+                key = str(st.secrets["GOOGLE_API_KEY"]).strip()
+        except Exception:
+            pass
+
+    # 3. Local Environment Variables
+    if not key:
+        key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or ""
+        ).strip()
+
+    # Automatically configure Gemini SDK if a valid key is found
+    if key:
+        genai.configure(api_key=key)
+
+    return key
 def get_genai_client(api_key: str) -> genai.Client:
     """Create and return a google-genai Client targeting the stable v1 API."""
 
@@ -129,35 +153,33 @@ def get_collection() -> Any:
     return get_chroma_client().get_or_create_collection(name=COLLECTION_NAME)
 
 
-def embed_texts(texts, api_key: str, for_query: bool = False) -> list:
-    """Embed text with Gemini Embedding 2 for RAG retrieval.
+def embed_texts(texts, for_query=False):
+    """Generates embeddings using text-embedding-004."""
+    # Guarantee genai is configured before making API calls
+    active_key = get_api_key()
+    if not active_key:
+        raise ValueError("No Gemini API key configured.")
 
-    Gemini Embedding 2 does not support the old ``task_type`` parameter.
-    For asymmetric retrieval, Google recommends putting the task instruction
-    directly into the query/document text.
-    """
-    client = get_genai_client(api_key)
+    task_type = "retrieval_query" if for_query else "retrieval_document"
 
-    def prepare(value: str) -> str:
-        if for_query:
-            return f"task: question answering | query: {value}"
-        return f"title: none | text: {value}"
+    # Ensure input is a list
+    if isinstance(texts, str):
+        texts = [texts]
 
-    if isinstance(texts, list):
-        embeddings = []
-        for text in texts:
-            response = client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=prepare(text),
-            )
-            embeddings.append(response.embeddings[0].values)
+    try:
+        response = genai.embed_content(
+            model="text-embedding-004", content=texts, task_type=task_type
+        )
+        embeddings = response["embedding"]
+
+        # If embedding a single string, wrap in list for ChromaDB
+        if len(texts) == 1 and isinstance(embeddings[0], float):
+            return [embeddings]
+
         return embeddings
-
-    response = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=prepare(texts),
-    )
-    return [response.embeddings[0].values]
+    except Exception as e:
+        st.error(f"Embedding error: {str(e)}")
+        return []
 
 def caption_image(image: Image.Image, api_key: str) -> str:
     """Generate a detailed text caption for an image using Gemini."""
@@ -197,55 +219,37 @@ def generate_answer(
     return (response.text or "").strip()
 
 
-def index_bytes(filename: str, data: bytes, api_key: str) -> int:
-    """Index a single file into ChromaDB, chunking and embedding its content."""
-    suffix = Path(filename).suffix.lower()
-    collection = get_collection()
-    added = 0
+def index_bytes(filename: str, data: bytes) -> int:
+    """Decodes upload bytes into text chunks and indexes into ChromaDB."""
+    try:
+        text_content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text_content = data.decode("latin-1", errors="ignore")
 
-    if suffix in PDF_TYPES:
-        text = extract_pdf_text(data)
-        kind = "pdf"
-        chunks = chunk_text(text)
-        extra_docs: list[tuple[str, dict[str, str]]] = [
-            (chunk, {"filename": filename, "type": kind, "chunk": str(i)})
-            for i, chunk in enumerate(chunks)
-        ]
-    elif suffix in TEXT_TYPES:
-        text = extract_text_file(data)
-        kind = "text"
-        chunks = chunk_text(text)
-        extra_docs = [
-            (chunk, {"filename": filename, "type": kind, "chunk": str(i)})
-            for i, chunk in enumerate(chunks)
-        ]
-    elif suffix in IMAGE_TYPES:
-        image = Image.open(io.BytesIO(data)).convert("RGB")
-        description = caption_image(image, api_key)
-        extra_docs = [
-            (
-                f"Image {filename}: {description}",
-                {"filename": filename, "type": "image", "chunk": "0"},
-            )
-        ]
-    else:
-        raise ValueError(f"Unsupported file type: {suffix or filename}")
-
-    if not extra_docs:
+    if not text_content.strip():
         return 0
 
-    documents = [doc for doc, _ in extra_docs]
-    metadatas = [meta for _, meta in extra_docs]
-    ids = [content_id(filename, meta["chunk"], doc) for doc, meta in extra_docs]
-    embeddings = embed_texts(documents, api_key=api_key, for_query=False)
-    collection.upsert(
-        ids=ids,
-        documents=documents,
-        metadatas=metadatas,
-        embeddings=embeddings,
+    # Break into 500-character chunks
+    chunk_size = 500
+    chunks = [
+        text_content[i : i + chunk_size]
+        for i in range(0, len(text_content), chunk_size)
+    ]
+
+    # Generate embeddings
+    embeddings = embed_texts(chunks, for_query=False)
+
+    if not embeddings:
+        return 0
+
+    ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
+    metadatas = [{"source": filename, "chunk_index": i} for i in range(len(chunks))]
+
+    collection.add(
+        documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas
     )
-    added += len(documents)
-    return added
+
+    return len(chunks)
 
 
 def retrieve(
