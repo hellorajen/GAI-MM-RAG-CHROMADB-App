@@ -87,20 +87,21 @@ def _secret(name: str) -> str:
         return ""
     return str(value or "")
 
-
 def get_api_key() -> str:
-    # 1. User entered manually in session state UI
-    keyed = st.session_state.get("google_api_key", "")
-    if keyed:
-        return str(keyed)
+    # 1. User entered a custom key in the UI field
+    if api_key_input and api_key_input.strip():
+        return api_key_input.strip()
     
-    # 2. Streamlit Cloud Secrets (checks both common naming conventions)
-    if "GEMINI_API_KEY" in st.secrets:
-        return str(st.secrets["GEMINI_API_KEY"])
-    if "GOOGLE_API_KEY" in st.secrets:
-        return str(st.secrets["GOOGLE_API_KEY"])
+    # 2. Check Streamlit Cloud Secrets (hidden backend key)
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"])
+        if "GOOGLE_API_KEY" in st.secrets:
+            return str(st.secrets["GOOGLE_API_KEY"])
+    except Exception:
+        pass
     
-   # 3. Environment Variables
+    # 3. Check Environment Variables
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
 
 
