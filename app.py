@@ -274,55 +274,60 @@ def init_state() -> None:
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Settings")
-        # 1. The UI text box starts completely EMPTY by default.
-        # We remove 'value=...' and use 'key="user_custom_api_key"' instead.
+
+        # UI Text Input: Starts empty by default to prevent secret key exposure.
+        # Clicking the eye icon will show nothing unless a user types a custom key.
         st.text_input(
             "Google AI Studio API key",
             type="password",
             key="user_custom_api_key",
             placeholder="Leave blank to use default backend key",
-            help="Stored in this session only. Enter your custom key to override default."
+            help="Stored in this session only. Leave blank to use the app's secure backend key.",
         )
-        st.session_state.google_api_key = api_key
 
-        n_results = st.slider("Retrieved chunks", min_value=1, max_value=8, value=4)
+        # Retrieve effective key for validation feedback
+        active_key = get_api_key()
+        if active_key:
+            st.caption("🔒 Key active and loaded securely from backend secrets.")
+        else:
+            st.warning(
+                "⚠️ No API key found. Enter a key above or configure Secrets."
+            )
 
         st.divider()
-        st.subheader("Ingest files")
-        uploads = st.file_uploader(
-            "PDF, text, or images",
-            type=["pdf", "txt", "md", "png", "jpg", "jpeg", "webp", "gif"],
+
+        # Document Upload Section
+        st.header("Document Ingestion")
+        uploaded_files = st.file_uploader(
+            "Upload Documents (PDF, TXT, MD, Images)",
+            type=["pdf", "txt", "md", "png", "jpg", "jpeg"],
             accept_multiple_files=True,
         )
-        ingest = st.button("Add to ChromaDB", type="primary", icon=":material/upload:")
 
-        if ingest:
-            if not api_key:
-                st.error("Add an API key before ingesting files.")
-            elif not uploads:
-                st.warning("Choose at least one file.")
+        added_total = 0
+        if uploaded_files:
+            if not active_key:
+                st.error("Please provide an API key before indexing documents.")
             else:
-                added_total = 0
-                with st.status("Indexing files", expanded=True) as status:
-                    for upload in uploads:
-                        data = upload.getvalue()
-                        st.write(f"Indexing {upload.name}")
-                        added_total += index_bytes(upload.name, data, api_key)
-                    status.update(
-                        label=f"Indexed {added_total} chunk(s)",
-                        state="complete",
-                    )
-                st.success(f"Added {added_total} chunk(s) to the collection.")
-                st.rerun()
+                with st.spinner("Indexing documents into ChromaDB..."):
+                    for upload in uploaded_files:
+                        data = upload.read()
+                        added_total += index_bytes(upload.name, data)
+                if added_total > 0:
+                    st.success(f"Indexed {added_total} chunks successfully!")
 
-        collection = get_collection()
-        st.caption(f"{collection.count()} chunk(s) in `{COLLECTION_NAME}`.")
-        if st.button("Clear collection", icon=":material/delete:"):
-            get_chroma_client().delete_collection(COLLECTION_NAME)
-            get_chroma_client.clear()
-            st.rerun()
+        st.divider()
 
-    return n_results
+        # Query & Retrieval Settings
+        st.header("Retrieval Settings")
+        n_results = st.slider(
+            "Number of context chunks to retrieve (k)",
+            min_value=1,
+            max_value=10,
+            value=3,
+        )
+
+        return n_results
 
 
 def _images_from_chat_files(files: list[Any]) -> list[Image.Image]:
