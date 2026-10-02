@@ -87,10 +87,14 @@ def _secret(name: str) -> str:
         return ""
     return str(value or "")
 
+import os
+import streamlit as st
+
 def get_api_key() -> str:
-    # 1. User entered a custom key in the UI field
-    if api_key_input and api_key_input.strip():
-        return api_key_input.strip()
+    # 1. User typed a custom key in the UI sidebar text input
+    user_typed_key = st.session_state.get("user_custom_api_key", "").strip()
+    if user_typed_key:
+        return user_typed_key
     
     # 2. Check Streamlit Cloud Secrets (hidden backend key)
     try:
@@ -103,7 +107,6 @@ def get_api_key() -> str:
     
     # 3. Check Environment Variables
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
-
 
 def get_genai_client(api_key: str) -> genai.Client:
     """Create and return a google-genai Client targeting the stable v1 API."""
@@ -271,11 +274,14 @@ def init_state() -> None:
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Settings")
-        api_key = st.text_input(
+        # 1. The UI text box starts completely EMPTY by default.
+        # We remove 'value=...' and use 'key="user_custom_api_key"' instead.
+        st.text_input(
             "Google AI Studio API key",
             type="password",
-            value=st.session_state.google_api_key,
-            help="Stored in this session only. You can also set GOOGLE_API_KEY or .streamlit/secrets.toml.",
+            key="user_custom_api_key",
+            placeholder="Leave blank to use default backend key",
+            help="Stored in this session only. Enter your custom key to override default."
         )
         st.session_state.google_api_key = api_key
 
