@@ -88,45 +88,13 @@ def _secret(name: str) -> str:
     return str(value or "")
 
 
-
 def get_api_key() -> str:
-    """Retrieves Google Gemini API key and automatically configures genai SDK."""
-    key = ""
+    keyed = st.session_state.get("google_api_key", "")
+    if keyed:
+        return str(keyed)
+    return _secret("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
 
-    # 1. Custom key entered in sidebar text input
-    user_typed_key = st.session_state.get("user_custom_api_key", "").strip()
-    if user_typed_key:
-        key = user_typed_key
 
-    # 2. Streamlit Cloud Secrets (hidden backend key)
-    if not key:
-        try:
-            if (
-                "GEMINI_API_KEY" in st.secrets
-                and str(st.secrets["GEMINI_API_KEY"]).strip()
-            ):
-                key = str(st.secrets["GEMINI_API_KEY"]).strip()
-            elif (
-                "GOOGLE_API_KEY" in st.secrets
-                and str(st.secrets["GOOGLE_API_KEY"]).strip()
-            ):
-                key = str(st.secrets["GOOGLE_API_KEY"]).strip()
-        except Exception:
-            pass
-
-    # 3. Local Environment Variables
-    if not key:
-        key = (
-            os.environ.get("GEMINI_API_KEY")
-            or os.environ.get("GOOGLE_API_KEY")
-            or ""
-        ).strip()
-
-    # Automatically configure Gemini SDK if a valid key is found
-    if key:
-        genai.configure(api_key=key)
-
-    return key
 def get_genai_client(api_key: str) -> genai.Client:
     """Create and return a google-genai Client targeting the stable v1 API."""
 
@@ -148,33 +116,35 @@ def get_collection() -> Any:
     return get_chroma_client().get_or_create_collection(name=COLLECTION_NAME)
 
 
-def embed_texts(texts, for_query=False):
-    """Generates embeddings using text-embedding-004."""
-    # Guarantee genai is configured before making API calls
-    active_key = get_api_key()
-    if not active_key:
-        raise ValueError("No Gemini API key configured.")
+def embed_texts(texts, api_key: str, for_query: bool = False) -> list:
+    """Embed text with Gemini Embedding 2 for RAG retrieval.
 
-    task_type = "retrieval_query" if for_query else "retrieval_document"
+    Gemini Embedding 2 does not support the old ``task_type`` parameter.
+    For asymmetric retrieval, Google recommends putting the task instruction
+    directly into the query/document text.
+    """
+    client = get_genai_client(api_key)
 
-    # Ensure input is a list
-    if isinstance(texts, str):
-        texts = [texts]
+    def prepare(value: str) -> str:
+        if for_query:
+            return f"task: question answering | query: {value}"
+        return f"title: none | text: {value}"
 
-    try:
-        response = genai.embed_content(
-            model="text-embedding-004", content=texts, task_type=task_type
-        )
-        embeddings = response["embedding"]
-
-        # If embedding a single string, wrap in list for ChromaDB
-        if len(texts) == 1 and isinstance(embeddings[0], float):
-            return [embeddings]
-
+    if isinstance(texts, list):
+        embeddings = []
+        for text in texts:
+            response = client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=prepare(text),
+            )
+            embeddings.append(response.embeddings[0].values)
         return embeddings
-    except Exception as e:
-        st.error(f"Embedding error: {str(e)}")
-        return []
+
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=prepare(texts),
+    )
+    return [response.embeddings[0].values]
 
 def caption_image(image: Image.Image, api_key: str) -> str:
     """Generate a detailed text caption for an image using Gemini."""
@@ -214,37 +184,55 @@ def generate_answer(
     return (response.text or "").strip()
 
 
-def index_bytes(filename: str, data: bytes) -> int:
-    """Decodes upload bytes into text chunks and indexes into ChromaDB."""
-    try:
-        text_content = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text_content = data.decode("latin-1", errors="ignore")
+def index_bytes(filename: str, data: bytes, api_key: str) -> int:
+    """Index a single file into ChromaDB, chunking and embedding its content."""
+    suffix = Path(filename).suffix.lower()
+    collection = get_collection()
+    added = 0
 
-    if not text_content.strip():
+    if suffix in PDF_TYPES:
+        text = extract_pdf_text(data)
+        kind = "pdf"
+        chunks = chunk_text(text)
+        extra_docs: list[tuple[str, dict[str, str]]] = [
+            (chunk, {"filename": filename, "type": kind, "chunk": str(i)})
+            for i, chunk in enumerate(chunks)
+        ]
+    elif suffix in TEXT_TYPES:
+        text = extract_text_file(data)
+        kind = "text"
+        chunks = chunk_text(text)
+        extra_docs = [
+            (chunk, {"filename": filename, "type": kind, "chunk": str(i)})
+            for i, chunk in enumerate(chunks)
+        ]
+    elif suffix in IMAGE_TYPES:
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        description = caption_image(image, api_key)
+        extra_docs = [
+            (
+                f"Image {filename}: {description}",
+                {"filename": filename, "type": "image", "chunk": "0"},
+            )
+        ]
+    else:
+        raise ValueError(f"Unsupported file type: {suffix or filename}")
+
+    if not extra_docs:
         return 0
 
-    # Break into 500-character chunks
-    chunk_size = 500
-    chunks = [
-        text_content[i : i + chunk_size]
-        for i in range(0, len(text_content), chunk_size)
-    ]
-
-    # Generate embeddings
-    embeddings = embed_texts(chunks, for_query=False)
-
-    if not embeddings:
-        return 0
-
-    ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [{"source": filename, "chunk_index": i} for i in range(len(chunks))]
-
-    collection.add(
-        documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas
+    documents = [doc for doc, _ in extra_docs]
+    metadatas = [meta for _, meta in extra_docs]
+    ids = [content_id(filename, meta["chunk"], doc) for doc, meta in extra_docs]
+    embeddings = embed_texts(documents, api_key=api_key, for_query=False)
+    collection.upsert(
+        ids=ids,
+        documents=documents,
+        metadatas=metadatas,
+        embeddings=embeddings,
     )
-
-    return len(chunks)
+    added += len(documents)
+    return added
 
 
 def retrieve(
@@ -273,60 +261,52 @@ def init_state() -> None:
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Settings")
-
-        # UI Text Input: Starts empty by default to prevent secret key exposure.
-        # Clicking the eye icon will show nothing unless a user types a custom key.
-        st.text_input(
+        api_key = st.text_input(
             "Google AI Studio API key",
             type="password",
-            key="user_custom_api_key",
-            placeholder="Leave blank to use default backend key",
-            help="Stored in this session only. Leave blank to use the app's secure backend key.",
+            value=st.session_state.google_api_key,
+            help="Stored in this session only. You can also set GOOGLE_API_KEY or .streamlit/secrets.toml.",
         )
+        st.session_state.google_api_key = api_key
 
-        # Retrieve effective key for validation feedback
-        active_key = get_api_key()
-        if active_key:
-            st.caption("🔒 Key active and loaded securely from backend secrets.")
-        else:
-            st.warning(
-                "⚠️ No API key found. Enter a key above or configure Secrets."
-            )
+        n_results = st.slider("Retrieved chunks", min_value=1, max_value=8, value=4)
 
         st.divider()
-
-        # Document Upload Section
-        st.header("Document Ingestion")
-        uploaded_files = st.file_uploader(
-            "Upload Documents (PDF, TXT, MD, Images)",
-            type=["pdf", "txt", "md", "png", "jpg", "jpeg"],
+        st.subheader("Ingest files")
+        uploads = st.file_uploader(
+            "PDF, text, or images",
+            type=["pdf", "txt", "md", "png", "jpg", "jpeg", "webp", "gif"],
             accept_multiple_files=True,
         )
+        ingest = st.button("Add to ChromaDB", type="primary", icon=":material/upload:")
 
-        added_total = 0
-        if uploaded_files:
-            if not active_key:
-                st.error("Please provide an API key before indexing documents.")
+        if ingest:
+            if not api_key:
+                st.error("Add an API key before ingesting files.")
+            elif not uploads:
+                st.warning("Choose at least one file.")
             else:
-                with st.spinner("Indexing documents into ChromaDB..."):
-                    for upload in uploaded_files:
-                        data = upload.read()
-                        added_total += index_bytes(upload.name, data)
-                if added_total > 0:
-                    st.success(f"Indexed {added_total} chunks successfully!")
+                added_total = 0
+                with st.status("Indexing files", expanded=True) as status:
+                    for upload in uploads:
+                        data = upload.getvalue()
+                        st.write(f"Indexing {upload.name}")
+                        added_total += index_bytes(upload.name, data, api_key)
+                    status.update(
+                        label=f"Indexed {added_total} chunk(s)",
+                        state="complete",
+                    )
+                st.success(f"Added {added_total} chunk(s) to the collection.")
+                st.rerun()
 
-        st.divider()
+        collection = get_collection()
+        st.caption(f"{collection.count()} chunk(s) in `{COLLECTION_NAME}`.")
+        if st.button("Clear collection", icon=":material/delete:"):
+            get_chroma_client().delete_collection(COLLECTION_NAME)
+            get_chroma_client.clear()
+            st.rerun()
 
-        # Query & Retrieval Settings
-        st.header("Retrieval Settings")
-        n_results = st.slider(
-            "Number of context chunks to retrieve (k)",
-            min_value=1,
-            max_value=10,
-            value=3,
-        )
-
-        return n_results
+    return n_results
 
 
 def _images_from_chat_files(files: list[Any]) -> list[Image.Image]:
