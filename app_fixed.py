@@ -257,14 +257,14 @@ def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("google_api_key", get_api_key())
 
-            #value=st.session_state.google_api_key,
+
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Settings")
         api_key = st.text_input(
             "Google AI Studio API key",
             type="password",
-            value="",
+            value=st.session_state.google_api_key,
             help="Stored in this session only. You can also set GOOGLE_API_KEY or .streamlit/secrets.toml.",
         )
         st.session_state.google_api_key = api_key
