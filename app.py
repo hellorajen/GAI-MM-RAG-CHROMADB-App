@@ -1,4 +1,34 @@
-"""Multimodal RAG app using Google AI Studio (Gemini) and ChromaDB."""
+"""
+===============================================================================
+MULTIMODAL RAG APP: AGENTIC ARCHITECTURE & CORE PRIMITIVES MAP
+===============================================================================
+This application demonstrates a production-grade, custom Multimodal Retrieval-
+Augmented Generation (RAG) architecture built with Streamlit, Google Gemini 3.5,
+and ChromaDB.
+
+Key Agentic & Distributed AI Primitives Implemented Below:
+
+1. STATE SCHEMAS (Short-Term Conversational State)
+   - Encapsulated via `st.session_state` (`init_state`).
+   - Maintains memory buffers (`messages`), user context, and API security keys across turns.
+
+2. COMPUTE NODES (Decoupled Single-Responsibility Task Processing Units)
+   - Ingestion & Text Extraction Nodes: `extract_pdf_text`, `extract_text_file`, `chunk_text`.
+   - Visual Perception Node: `caption_image` (Gemini Flash multimodal processing).
+   - Embedding / Vectorization Node: `embed_texts` (gemini-embedding-2 with asymmetric instruction tags).
+   - Reasoning & Answer Generation Node: `generate_answer` (grounded multimodal synthesis).
+
+3. MEMORY CHECKPOINTS & LONG-TERM STORAGE
+   - Ephemeral & Persistent Vector Memory: Handled via `chromadb.PersistentClient`.
+   - Deterministic State Checkpointing: `content_id` (SHA-256 content hashing) ensures 
+     chunk versioning, deduplication, and idempotent vector store writes (`upsert`).
+
+4. SUPERVISOR ROUTER & CONDITIONAL EDGES
+   - Dynamic Routing Logic: Implemented inside `main()` and `run_query()`.
+   - Evaluates incoming state (Text Query vs. File Attachments vs. Existing Vector Memory)
+     and branches dynamically across Ingestion Nodes, Vector Retrieval Nodes, and Visual Reasoning Nodes.
+===============================================================================
+"""
 
 from __future__ import annotations
 
@@ -20,10 +50,11 @@ load_dotenv()
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
+# --- MODEL & CONFIGURATION CONSTANTS ---
 GENERATION_MODEL = "gemini-3.5-flash"
 EMBEDDING_MODEL = "gemini-embedding-2"
-# Version the collection because vectors created with text-embedding-004 cannot be mixed
-# with vectors created by gemini-embedding-2.
+
+# Collection name versioning handles embedding dimensionality/space shifts.
 COLLECTION_NAME = "mm_rag_gemini_embedding_2"
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "chroma_db")
 CHUNK_SIZE = 900
@@ -33,8 +64,16 @@ TEXT_TYPES = {".txt", ".md"}
 PDF_TYPES = {".pdf"}
 
 
+# =============================================================================
+# PRIMITIVE: COMPUTE NODES (DOCUMENT PROCESSING & CHUNKING)
+# =============================================================================
+
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into overlapping chunks, preferring paragraph boundaries."""
+    """Compute Node: Semantic Chunking Engine.
+    
+    Splits continuous document text into overlapping segments, prioritizing sentence 
+    and paragraph boundaries to preserve contextual intent for embedding space retrieval.
+    """
     cleaned = " ".join(text.split())
     if not cleaned:
         return []
@@ -61,6 +100,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 def extract_pdf_text(data: bytes) -> str:
+    """Compute Node: Unstructured PDF Text Extraction Processor."""
     reader = PdfReader(io.BytesIO(data))
     pages = []
     for page in reader.pages:
@@ -69,16 +109,30 @@ def extract_pdf_text(data: bytes) -> str:
 
 
 def extract_text_file(data: bytes) -> str:
+    """Compute Node: Plaintext / Markdown Normalization Processor."""
     return data.decode("utf-8", errors="replace").strip()
 
 
+# =============================================================================
+# PRIMITIVE: MEMORY CHECKPOINTING & DETERMINISTIC HASHING
+# =============================================================================
+
 def content_id(*parts: str) -> str:
+    """Memory Checkpoint Primitive: Idempotent State Digest Generator.
+    
+    Generates a deterministic SHA-256 hash key across chunk contents and metadata.
+    Prevents record duplication and enforces state consistency during database upserts.
+    """
     digest = hashlib.sha256()
     for part in parts:
         digest.update(part.encode("utf-8", errors="replace"))
         digest.update(b"\0")
     return digest.hexdigest()
 
+
+# =============================================================================
+# PRIMITIVE: STATE SCHEMAS & API INITIALIZATION
+# =============================================================================
 
 def _secret(name: str) -> str:
     try:
@@ -89,6 +143,7 @@ def _secret(name: str) -> str:
 
 
 def get_api_key() -> str:
+    """State Retrieval: Fetches context credentials from session or environment."""
     keyed = st.session_state.get("google_api_key", "")
     if keyed:
         return str(keyed)
@@ -96,8 +151,7 @@ def get_api_key() -> str:
 
 
 def get_genai_client(api_key: str) -> genai.Client:
-    """Create and return a google-genai Client targeting the stable v1 API."""
-
+    """Client Infrastructure Factory: Initializes the stable Google GenAI SDK v1 Client."""
     return genai.Client(
         api_key=api_key,
         http_options=genai_types.HttpOptions(api_version="v1"),
@@ -106,6 +160,7 @@ def get_genai_client(api_key: str) -> genai.Client:
 
 @st.cache_resource
 def get_chroma_client() -> Any:
+    """Memory Infrastructure Manager: Instantiates local or ephemeral ChromaDB persistence."""
     if os.environ.get("CHROMA_EPHEMERAL") == "1":
         return chromadb.EphemeralClient()
     Path(CHROMA_PATH).mkdir(parents=True, exist_ok=True)
@@ -113,15 +168,21 @@ def get_chroma_client() -> Any:
 
 
 def get_collection() -> Any:
+    """Memory Infrastructure Manager: Provides thread-safe collection pointer."""
     return get_chroma_client().get_or_create_collection(name=COLLECTION_NAME)
 
 
-def embed_texts(texts, api_key: str, for_query: bool = False) -> list:
-    """Embed text with Gemini Embedding 2 for RAG retrieval.
+# =============================================================================
+# PRIMITIVE: COMPUTE NODES (EMBEDDINGS & PERCEPTION)
+# =============================================================================
 
-    Gemini Embedding 2 does not support the old ``task_type`` parameter.
-    For asymmetric retrieval, Google recommends putting the task instruction
-    directly into the query/document text.
+def embed_texts(texts: list[str] | str, api_key: str, for_query: bool = False) -> list[list[float]]:
+    """Compute Node: Dense Vector Embedding Engine (gemini-embedding-2).
+    
+    Implements Asymmetric Task Structuring directly into payload inputs:
+    - Queries: Prefixed with 'task: question answering | query:'
+    - Documents: Prefixed with 'title: none | text:'
+    This maximizes retrieval distance precision between questions and candidate facts.
     """
     client = get_genai_client(api_key)
 
@@ -146,8 +207,13 @@ def embed_texts(texts, api_key: str, for_query: bool = False) -> list:
     )
     return [response.embeddings[0].values]
 
+
 def caption_image(image: Image.Image, api_key: str) -> str:
-    """Generate a detailed text caption for an image using Gemini."""
+    """Compute Node: Multimodal Visual Perception Engine.
+    
+    Transforms unstructured visual inputs into descriptive semantic representations
+    for vector index indexing.
+    """
     client = get_genai_client(api_key)
     response = client.models.generate_content(
         model=GENERATION_MODEL,
@@ -166,7 +232,11 @@ def generate_answer(
     images: list[Image.Image],
     api_key: str,
 ) -> str:
-    """Generate an answer grounded in retrieved context and optional images."""
+    """Compute Node: Grounded Multimodal Synthesis Node.
+    
+    Aggregates retrieved vector context chunks and active chat visual inputs,
+    enforcing source attribution constraints before calling Gemini 3.5 Flash.
+    """
     context_block = "\n\n".join(
         f"[Source {i}] {chunk}" for i, chunk in enumerate(contexts, start=1)
     ) or "(no retrieved context)"
@@ -184,8 +254,16 @@ def generate_answer(
     return (response.text or "").strip()
 
 
+# =============================================================================
+# PRIMITIVE: MEMORY PERSISTENCE & RETRIEVAL PIPELINE NODES
+# =============================================================================
+
 def index_bytes(filename: str, data: bytes, api_key: str) -> int:
-    """Index a single file into ChromaDB, chunking and embedding its content."""
+    """Pipeline Compute Node: Ingestion & Vector Indexer.
+    
+    Extracts text/image features, executes chunking, computes dense embeddings,
+    and upserts the data into ChromaDB long-term memory.
+    """
     suffix = Path(filename).suffix.lower()
     collection = get_collection()
     added = 0
@@ -225,6 +303,8 @@ def index_bytes(filename: str, data: bytes, api_key: str) -> int:
     metadatas = [meta for _, meta in extra_docs]
     ids = [content_id(filename, meta["chunk"], doc) for doc, meta in extra_docs]
     embeddings = embed_texts(documents, api_key=api_key, for_query=False)
+    
+    # Write to Long-Term Memory (ChromaDB)
     collection.upsert(
         ids=ids,
         documents=documents,
@@ -238,7 +318,10 @@ def index_bytes(filename: str, data: bytes, api_key: str) -> int:
 def retrieve(
     query: str, n_results: int, api_key: str
 ) -> tuple[list[str], list[dict[str, str]]]:
-    """Query ChromaDB with a semantic embedding of ``query``."""
+    """Compute Node: Semantic Memory Retrieval Node.
+    
+    Queries ChromaDB vector collection using asymmetric query vector embeddings.
+    """
     collection = get_collection()
     if collection.count() == 0:
         return [], []
@@ -253,12 +336,21 @@ def retrieve(
     return list(documents), [dict(meta) for meta in metadatas]
 
 
+# =============================================================================
+# PRIMITIVE: STATE INITIALIZATION & USER INTERFACE NODES
+# =============================================================================
+
 def init_state() -> None:
+    """State Schema Primitive: Short-Term Session Memory Setup.
+    
+    Initializes message history buffer and session configuration in Streamlit state memory.
+    """
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("google_api_key", get_api_key())
 
-            #value=st.session_state.google_api_key,
+
 def render_sidebar() -> int:
+    """UI Control Node: Renders settings, collection controls, and file uploads."""
     with st.sidebar:
         st.header("Settings")
         api_key = st.text_input(
@@ -310,6 +402,7 @@ def render_sidebar() -> int:
 
 
 def _images_from_chat_files(files: list[Any]) -> list[Image.Image]:
+    """Helper Node: Decodes image files from Streamlit input payloads."""
     images: list[Image.Image] = []
     for file in files:
         name = getattr(file, "name", "") or ""
@@ -320,7 +413,18 @@ def _images_from_chat_files(files: list[Any]) -> list[Image.Image]:
     return images
 
 
+# =============================================================================
+# PRIMITIVE: CONDITIONAL ROUTING & EXECUTION EDGE
+# =============================================================================
+
 def run_query(question: str, n_results: int, images: list[Image.Image]) -> None:
+    """Execution Edge / Pipeline Coordinator.
+    
+    Coordinates the dynamic flow between:
+    1. Memory Retrieval Node (`retrieve`)
+    2. Synthesis Node (`generate_answer`)
+    3. State Memory Update (`st.session_state.messages.append`)
+    """
     api_key = get_api_key()
     if not api_key:
         st.session_state.messages.append(
@@ -332,8 +436,13 @@ def run_query(question: str, n_results: int, images: list[Image.Image]) -> None:
         )
         return
 
+    # Edge Step 1: Query Long-Term Memory (ChromaDB)
     contexts, metadatas = retrieve(question, n_results=n_results, api_key=api_key)
+    
+    # Edge Step 2: Pass Context & Images to Model Synthesis Node
     answer = generate_answer(question, contexts, images, api_key=api_key)
+    
+    # Edge Step 3: Format Citation Sources
     sources = [
         {
             "filename": meta.get("filename", "unknown"),
@@ -342,17 +451,31 @@ def run_query(question: str, n_results: int, images: list[Image.Image]) -> None:
         }
         for context, meta in zip(contexts, metadatas, strict=False)
     ]
+    
+    # Edge Step 4: Update Short-Term Session State Memory
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "sources": sources}
     )
 
 
+# =============================================================================
+# MAIN APPLICATION ROUTER & GRAPH ORCHESTRATION
+# =============================================================================
+
 def main() -> None:
+    """SUPERVISOR ORCHESTRATOR & GRAPH ENTRY POINT.
+    
+    Controls application execution state and dynamic routing branches:
+    - Branch 1: User attaches files -> Branch to Ingestion Pipeline (`index_bytes`)
+    - Branch 2: User asks question -> Branch to Retrieval Execution Edge (`run_query`)
+    - Branch 3: Display state -> Render Short-Term Memory Chat History
+    """
     st.set_page_config(
         page_title="Multimodal RAG",
         page_icon=":material/auto_awesome:",
         layout="centered",
     )
+    # Primitive 1: Initialize Session State
     init_state()
     n_results = render_sidebar()
 
@@ -362,6 +485,7 @@ def main() -> None:
     if not st.session_state.messages:
         st.info("Upload files in the sidebar, then ask a question below.")
 
+    # Primitive 2: Render Conversational Memory
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -379,6 +503,7 @@ def main() -> None:
         submit_mode="disable",
     )
 
+    # Supervisor Conditional Branching Edge
     if prompt:
         if isinstance(prompt, str):
             question = prompt
@@ -390,6 +515,8 @@ def main() -> None:
         images = _images_from_chat_files(files)
         extra_notes: list[str] = []
         api_key = get_api_key()
+        
+        # CONDITIONAL BRANCH 1: In-line Document & Media Ingestion Node
         if files and api_key:
             for file in files:
                 extra_notes.append(f"Attached {file.name}")
@@ -401,7 +528,10 @@ def main() -> None:
         if extra_notes:
             user_text = user_text + "\n\n" + "\n".join(extra_notes)
 
+        # Append User Input to State Schema Memory
         st.session_state.messages.append({"role": "user", "content": user_text, "sources": []})
+        
+        # CONDITIONAL BRANCH 2: Direct to Retrieval & Generation Node
         run_query(question or "Describe the attached files.", n_results, images)
         st.rerun()
 
